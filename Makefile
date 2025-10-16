@@ -1,14 +1,16 @@
 SHELL := /bin/bash
-CURRENT_UID := $(shell id -u)
-CURRENT_GID := $(shell id -g)
-newsblur := $(shell gtimeout 2s docker ps -qf "name=newsblur_web")
+# Use timeout on Linux and gtimeout on macOS
+TIMEOUT_CMD := $(shell command -v gtimeout 2>/dev/null || command -v timeout 2>/dev/null || echo timeout)
+newsblur := $(shell $(TIMEOUT_CMD) 2s docker ps -qf "name=newsblur_web" 2>/dev/null || docker ps -qf "name=newsblur_web")
 
 .PHONY: node
 
 nb: pull bounce migrate bootstrap collectstatic
+nb-fast: pull bounce-fast migrate bootstrap collectstatic
+nbfast: nb-fast
 
 metrics:
-	RUNWITHMAKEBUILD=True CURRENT_UID=${CURRENT_UID} CURRENT_GID=${CURRENT_GID} docker compose -f docker-compose.yml -f docker-compose.metrics.yml up -d
+	docker compose -f docker-compose.yml -f docker-compose.metrics.yml up -d
 
 collectstatic: 
 	rm -fr static
@@ -17,20 +19,25 @@ collectstatic:
 
 #creates newsblur, builds new images, and creates/refreshes SSL keys
 bounce:
-	RUNWITHMAKEBUILD=True CURRENT_UID=${CURRENT_UID} CURRENT_GID=${CURRENT_GID} docker compose down
+	docker compose down
 	[[ -d config/certificates ]] && echo "keys exist" || make keys
-	RUNWITHMAKEBUILD=True CURRENT_UID=${CURRENT_UID} CURRENT_GID=${CURRENT_GID} docker compose up -d --build --remove-orphans
+	docker compose up -d --build --remove-orphans
+
+bounce-fast:
+	docker compose down
+	docker compose up -d --remove-orphans
 
 bootstrap:
 	docker exec newsblur_web ./manage.py loaddata config/fixtures/bootstrap.json
 
 nbup:
-	RUNWITHMAKEBUILD=True CURRENT_UID=${CURRENT_UID} CURRENT_GID=${CURRENT_GID} docker compose up -d --build --remove-orphans
+	docker compose up -d --build --remove-orphans
 coffee:
 	coffee -c -w **/*.coffee
 migrations:
 	docker exec -it newsblur_web ./manage.py makemigrations
 makemigration: migrations
+makemigrations: migrations
 datamigration: 
 	docker exec -it newsblur_web ./manage.py makemigrations --empty $(app)
 migration: migrations
@@ -44,15 +51,16 @@ bash:
 debug:
 	docker attach ${newsblur}
 log:
-	RUNWITHMAKEBUILD=True docker compose logs -f --tail 20 newsblur_web newsblur_node
-logweb: log
+	docker compose logs -f --tail 20 newsblur_web newsblur_node
+logweb:
+	docker compose logs -f --tail 20 newsblur_web newsblur_node task_celery
 logcelery:
-	RUNWITHMAKEBUILD=True docker compose logs -f --tail 20 task_celery
+	docker compose logs -f --tail 20 task_celery
 logtask: logcelery
 logmongo:
-	RUNWITHMAKEBUILD=True docker compose logs -f db_mongo
+	docker compose logs -f db_mongo
 alllogs: 
-	RUNWITHMAKEBUILD=True docker compose logs -f --tail 20
+	docker compose logs -f --tail 20
 logall: alllogs
 mongo:
 	docker exec -it db_mongo mongo --port 29019
@@ -63,27 +71,49 @@ postgres:
 stripe:
 	stripe listen --forward-to localhost/zebra/webhooks/v2/
 down:
-	RUNWITHMAKEBUILD=True docker compose -f docker-compose.yml -f docker-compose.metrics.yml down
+	docker compose -f docker-compose.yml -f docker-compose.metrics.yml down
 nbdown: down
 jekyll:
-	cd blog && bundle exec jekyll serve
+	cd blog && JEKYLL_ENV=production bundle exec jekyll serve --config _config.yml
 jekyll_drafts:
-	cd blog && bundle exec jekyll serve --drafts
+	cd blog && JEKYLL_ENV=production bundle exec jekyll serve --drafts --config _config.yml
+lint:
+	docker exec -t newsblur_web isort --profile black .
+	docker exec -t newsblur_web black --line-length 110 .
+	docker exec -t newsblur_web flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics --exclude=venv,apps/analyzer/archive,utils/archive,vendor
+	
+deps:
+	docker exec -t newsblur_web pip install -U uv
+	docker exec -t newsblur_web uv pip install -r requirements.txt
 
+jekyll_build:
+	cd blog && JEKYLL_ENV=production bundle exec jekyll build
+	
 # runs tests
+# Usage: make test [SCOPE=apps.reader] [ARGS="--noinput -v 2"]
+SCOPE ?= apps
+ARGS ?= --noinput -v 1 --failfast
 test:
-	RUNWITHMAKEBUILD=True CURRENT_UID=${CURRENT_UID} CURRENT_GID=${CURRENT_GID} TEST=True docker compose -f docker-compose.yml up -d newsblur_web
-	RUNWITHMAKEBUILD=True CURRENT_UID=${CURRENT_UID} CURRENT_GID=${CURRENT_GID} docker compose exec newsblur_web bash -c "NOSE_EXCLUDE_DIRS=./vendor DJANGO_SETTINGS_MODULE=newsblur_web.test_settings python3 manage.py test -v 3 --failfast"
+	docker compose exec -T newsblur_web python3 manage.py test $(SCOPE) --noinput $(ARGS)
 
 keys:
-	mkdir config/certificates
+	mkdir -p config/certificates
 	openssl dhparam -out config/certificates/dhparam-2048.pem 2048
 	openssl req -x509 -nodes -new -sha256 -days 1024 -newkey rsa:2048 -keyout config/certificates/RootCA.key -out config/certificates/RootCA.pem -subj "/C=US/CN=Example-Root-CA"
 	openssl x509 -outform pem -in config/certificates/RootCA.pem -out config/certificates/RootCA.crt
 	openssl req -new -nodes -newkey rsa:2048 -keyout config/certificates/localhost.key -out config/certificates/localhost.csr -subj "/C=US/ST=YourState/L=YourCity/O=Example-Certificates/CN=localhost"
 	openssl x509 -req -sha256 -days 1024 -in config/certificates/localhost.csr -CA config/certificates/RootCA.pem -CAkey config/certificates/RootCA.key -CAcreateserial -out config/certificates/localhost.crt
 	cat config/certificates/localhost.crt config/certificates/localhost.key > config/certificates/localhost.pem
-	sudo /usr/bin/security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ./config/certificates/RootCA.crt
+	@if [ "$$(uname)" = "Darwin" ]; then \
+		sudo /usr/bin/security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain ./config/certificates/RootCA.crt; \
+	elif [ "$$(uname)" = "Linux" ]; then \
+		echo "Installing certificate for Linux..."; \
+		sudo cp ./config/certificates/RootCA.crt /usr/local/share/ca-certificates/newsblur-rootca.crt || true; \
+		sudo update-ca-certificates || true; \
+		echo "Certificate installation attempted. If this fails, you may need to manually trust the certificate."; \
+	else \
+		echo "Unknown OS. Please manually trust the certificate at ./config/certificates/RootCA.crt"; \
+	fi
 
 # Doesn't work yet
 mkcert:
@@ -115,7 +145,8 @@ inventory:
 	./ansible/utils/generate_inventory.py
 oldinventory:
 	OLD=1 ./ansible/utils/generate_inventory.py
-
+hinventory:
+	./ansible/utils/generate_hetzner_inventory.py
 # Docker
 pull:
 	docker pull newsblur/newsblur_python3
@@ -173,6 +204,13 @@ monitor: deploy_monitor
 deploy_staging:
 	ansible-playbook ansible/deploy.yml -l staging
 staging: deploy_staging
+deploy_staging_static: staging_static
+staging_static:
+	ansible-playbook ansible/deploy.yml -l staging --tags static
+test_deploy_staging:
+	./utils/load_test_deploy.sh --staging
+test_deploy_app:
+	./utils/load_test_deploy.sh --app
 celery_stop:
 	ansible-playbook ansible/deploy.yml -l task --tags stop
 sentry:
@@ -181,10 +219,12 @@ maintenance_on:
 	ansible-playbook ansible/deploy.yml -l web --tags maintenance_on
 maintenance_off:
 	ansible-playbook ansible/deploy.yml -l web --tags maintenance_off
+env:
+	ansible-playbook ansible/setup.yml -l app,task --tags env
 
 # Provision
 firewall:
-	ansible-playbook ansible/all.yml -l db --tags firewall
+	ansible-playbook ansible/all.yml -l db --tags ufw
 oldfirewall:
 	ANSIBLE_CONFIG=/srv/newsblur/ansible.old.cfg ansible-playbook ansible/all.yml  -l db --tags firewall
 repairmongo:
@@ -197,6 +237,11 @@ mongodump:
 mongorestore:
 	cp -fr docker/volumes/mongodump docker/volumes/db_mongo/
 	docker exec -it db_mongo mongorestore --port 29019 -d newsblur /data/db/mongodump/newsblur
+pgrestore:
+	docker exec -it db_postgres bash -c "psql -U newsblur -c 'CREATE DATABASE newsblur_prod;'; pg_restore -U newsblur --role=newsblur --dbname=newsblur_prod /var/lib/postgresql/data/backup_postgresql_2023-10-10-04-00.sql.sql"
+redisrestore:
+	docker exec -it db_redis bash -c "redis-cli -p 6579 --pipe < /data/backup_db_redis_user_2023-10-21-04-00.rdb.gz"
+	docker exec -it db_redis bash -c "redis-cli -p 6579 --pipe < /data/backup_db_redis_story2_2023-10-21-04-00.rdb.gz"
 index_feeds:
 	docker exec -it newsblur_web ./manage.py index_feeds
 index_stories:
@@ -218,4 +263,4 @@ clean:
 
 
 grafana-dashboards:
-	python3 utils/grafana_backup.py
+	uv run python utils/grafana_backup.py
